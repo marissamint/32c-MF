@@ -1,0 +1,1786 @@
+---
+title: "32C_T_analysis (FlowDensity)"
+output:
+  html_document:
+    code_folding: hide
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    toc: yes
+---
+
+for T tube acquired with reduced volts setting
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T, message = FALSE)
+```
+
+
+"XXX_BATCH_XXX"
+
+Debuging chunk
+```{r eval=FALSE, include=FALSE}
+AUTOFLOW_destination <- "AUTOFLOW_destination"
+```
+
+
+fs: flowFrame
+gs: gatingSet
+cp: cellpopulation. cp.ApBp_CpDp (A,B,C,D markers ). For example: cp.CD2CD3_CD45pCD14n
+gt: gate. cp.AB_CpDp (). For example: gt.quad.CD2CD3_CD45pCD14n
+ct: cut, one dimensional cut
+tp: temp variables in function
+
+
+This version uses scattermore plotting scheme
+
+# Preparation
+```{r}
+# Preparation
+## Load packages
+library(flowCore)
+library(flowDensity, quietly = TRUE)
+library(flowWorkspace, quietly = TRUE) # has to be the github version to use the functions like gs_pop_add
+library(speedyflowplot)
+library(readxl)
+library(scales)
+library(plotly)
+source("flowPrep2.R")
+source("utils.R")
+# source(paste0(AUTOFLOW_destination, "R/f.PlotFlowFrame2.R"))
+# source(paste0(AUTOFLOW_destination, "R/flowPlot2.R"))
+
+
+# ========Define Autoflow destination based on computers ====================
+
+#if (Sys.info()["sysname"] == "Linux") {
+  # AUTOFLOW_destination =  paste0(dirname(getwd()), "/") #gsub("AUTOFLOW/LPD_GUI", "",getwd()) #not able to get the parent path directly
+#} else {
+#  if (Sys.info()["sysname"] %in% "Windows") {
+#    if (Sys.info()["nodename"] %in% c("PC049050", "PC062856")) {
+#      # AUTOFLOW_destination <- "G:/Flow/Research and Development/"
+#    } else if (Sys.info()["nodename"] %in% c("P1")) {
+#      # AUTOFLOW_destination <- "C:/Users/victo/Resilio_Sync/Mac_and_PC/"
+#    } else {
+#      # AUTOFLOW_destination <- "H:/Lab_Medicine/Section Flow Cytometry/AUTOFLOW/"
+#    }
+#  }
+#}
+```
+
+```{r}
+## define path
+path.input <- "G:/BF_32c/PB/tubeB/test"
+# new.data <- ifelse(length(grep(path.input, pattern = "NEW")) > 0, yes = T, no = F)
+# sub.folder <- ifelse(new.data, yes = "NEW", no = "")
+path.output <- "/Reports_OUT"
+panel <- "Bcells"
+Clean.fcs <- "TRUE"
+max_analyzing_number <- 100000
+transformation.parameters.path <- paste0(
+  AUTOFLOW_destination,
+  "/src/A5_32c_trans_parameters_B_v4.csv"
+)
+# B_comp_path <- "/Users/flowuser/Documents/FCS/0403/spillover_B_20250430_April0304.csv"
+# spillover_B_20251023_143636.csv
+# B_comp_path <- "/Users/flowuser/Documents/Reports_OUT/20251023/comp/spillover_B_20251023_143636.csv"
+layouts <- paste0(AUTOFLOW_destination, "/src/30c_B_layout_CLF_noRG.xlsx")
+plotting_global_mins <- paste0(AUTOFLOW_destination, "/src/A5_32c_Plotting_global_min.csv")
+
+```
+
+
+
+
+
+
+
+# PART I Data Pre-processing
+## Load FCS files
+```{r}
+fs.file <- "G:/BF_32c/PB/tubeB/test/xBF25-3859 PB tubeB_B11.fcs"
+fs.names <- "xBF25-3859 PB tubeB_B11.fcs"
+analysis <- "SingleCase"
+```
+
+```{r}
+if (grepl(".fcs", fs.names) == T) {
+  BF <- StrExtract(fs.names, " ", 1)
+} else {
+  fs.file <- grep(list.files(path.input, pattern = ".fcs", full.names = T), # With full path
+    pattern = "tubeB", inv = F, value = T
+  ) # [c(5,9,10,21,23)]
+  fs.names <- grep(list.files(path.input, pattern = ".fcs", full.names = F),
+    pattern = "tubeB", inv = F, value = T
+  ) # [c(5,9,10,21,23)]
+  analysis <- "Batch"
+}
+
+batchfolder <- "20251106"
+folder <- paste(path.output, batchfolder, sep = "/")
+#
+
+
+fs.raw <- tryCatch(regs_pop_add.flowSet(files = fs.file), error = function(x) {
+  return(1)
+})
+
+if (fs.raw == 1) {
+  fs.raw <- as(lapply(fs.file, function(p1) {
+    f <- read.FCS(p1, transformation = F, truncate_max_range = F)
+    if (nrow(f) > max_analyzing_number) {
+      f <- f[sample(1:nrow(f), max_analyzing_number), ]
+    }
+
+    return(f)
+  }), Class = "flowSet")
+}
+
+sampleNames(fs.raw) <- fs.names
+```
+
+
+
+
+Remove the NA events
+This is fairly recent thing that NAs are shoing up in the data 
+```{r}
+markers <- StrExtract(as.character(na.omit(parameters(fs.raw[[1]])$desc)), "_", 1)
+# markers <- markers[!markers %in% c("LiveDead", "CD19")]
+markers
+channels.ind <- Find.markers(fs.raw[[1]], markers)
+```
+
+
+removing too bright events. this line is needed. the bright events gonna squeeze the channels such as fsc and ssc 
+```{r eval=FALSE, include=FALSE}
+fs.raw <- fsApply(fs.raw, f.remove_tooBright_events, c("FSC-A", "FSC-H", "SSC-A", "V710-A"))
+```
+
+
+
+
+# Temp fix 
+
+```{r}
+fs.raw <- fsApply(fs.raw, function(x) {
+  x@parameters@data$desc[47] <- "CD180_PE-Cy7" 
+  x
+})
+```
+
+
+
+
+
+
+```{r}
+gs <- GatingSet(fs.raw) # [c(5,7:11,14,16:20,23)]
+```
+
+## Compensation and transformation
+```{r}
+## ==========================================================================
+## Prepare compensation matrix
+## - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+#B_SPILL_CSV <- read.csv(B_comp_path, row.names = 1)
+#B_SPILL_CSV <- as.matrix(B_SPILL_CSV)
+comp <- f.custom_compensation(fs.raw[[1]], NULL)
+comp.list <- fsApply(fs.raw, function(f) compensation(comp))
+
+# # comp_diff <-  round(comp*100,2) -round(machine_comp*100,2)
+# comp_notes <- f.compare_comp_matrix(fs.raw[[1]], comp)
+# names(comp_notes) <- sampleNames(fs.raw[1])
+#
+# # track the difference in the comp
+# if (is.null(B_SPILL_CSV)) {
+#   comp_notes <- c("B COMP tweaks: ", comp_notes)
+# } else {
+#   # comp_notes <- c("T COMP tweaks based on csv file: ", T_SPILL_FILE)
+# }
+#
+# comp_notes <- list(comp_notes)
+# names(comp_notes) <- sampleNames(fs.raw[1])
+
+
+## ==========================================================================
+## Creating gatingset and applying compensation
+## - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+gs <- compensate(gs, comp.list) # A pply comps
+recompute(gs)
+
+
+
+
+# Finding markers & transforming -----------------------------------------------------
+
+gs <- transform.logicle_R4(gs, # trans.chans = channels.ind,
+  PathtoParameters = transformation.parameters.path
+) # this is a custom function that added the w info into the flowframe, which is ingenous
+recompute(gs)
+
+# channels <- colnames(fs.raw[[1]])
+# para <- read.csv(transformation.parameters.path, row.names = 1)
+# para <- para[ channels[!grepl("SC|ime", channels)],]
+#  l.para <- lapply(colnames(para), function(x) {para[,x]})
+#  names(l.para) <- colnames(para)
+# gs@transformation <-  l.para
+```
+
+
+# PART II Perform Gating
+The flow density based gatings are based on following steps
+1. use getData(gs, popname) to extract the flowframe
+2. perform gating, usually packaged in function
+3. return a cell population or a gate 
+4. use "gs_pop_add" to add the new population to the gs
+
+
+## Time Gate
+Time parameter is finicky somehow, maybe use events (just as woodlist) is a better idea
+```{r}
+```
+
+
+## Margin gate
+a gate to exclude all the events on the edges 
+```{r}
+# Creating margin gates
+fs <- gs_pop_get_data(gs, "root")
+
+margin.gates <- fsApply(fs, removeMargins, c("FSC-A", "SSC-A"), return.gate = T)
+
+rg <- lapply(1:nrow(margin.gates), function(x) {
+  return(rectangleGate(
+    filterId = "Margin", "FSC-A" = c(1, margin.gates[x, 1]),
+    "SSC-A" = c(1, margin.gates[x, 2])
+  ))
+})
+
+names(rg) <- sampleNames(fs)
+
+nodeID1 <- gs_pop_add(gs, rg) # ,"Margin")
+recompute(gs)
+```
+
+```{r}
+Others <- booleanFilter(`!Margin`, filterId = "Off_scale")
+gs_pop_add(gs, Others, parent = "root", name = "Off_scale")
+recompute(gs)
+```
+
+## Singlet Gate
+### Perform Singlet Gate
+The idea is to do a linear regression to find the slope and rot accordingly then perform the gate
+```{r fig.width=20, fig.height= 5}
+parent_pop <- "Margin"
+
+fs <- gs_pop_get_data(gs, parent_pop)
+tp.gates <- fsApply(fs, f.singlets_gating)
+```
+
+### Add Singlet Gate
+```{r, fig.height=3, fig.width=15}
+gs_pop_add(gs, tp.gates, parent = parent_pop)
+recompute(gs)
+plot(gs)
+
+rm(tp.gates)
+rm(parent_pop)
+```
+
+## livedead Gate
+### Perform livedead Gate
+```{r fig.width=20, fig.height= 5}
+parent_pop <- "Singlets"
+fs <- gs_pop_get_data(gs, parent_pop)
+tp.gates <- fsApply(fs, f.livedead_gating)
+
+# plotDens(tp_fs.rot_HA, c("FSC-A", "FSC-H"),density.overlay = c(T,T))
+```
+### Add livedead Gate
+```{r, fig.height=3, fig.width=15}
+gs_pop_add(gs, tp.gates, parent = parent_pop)
+recompute(gs)
+plot(gs)
+```
+
+## WBC gating
+### Perform gate 
+```{r fig.width=12, fig.height= 3}
+parent_pop <- "Live"
+
+fs <- gs_pop_get_data(gs, parent_pop)
+tp.gates <- fsApply(fs, f.WBC_gating)
+
+### add gate
+```
+
+
+```{r, fig.height=3, fig.width=15}
+for (i in 1:length(tp.gates[[1]])) {
+  gs_pop_add(gs, lapply(tp.gates, "[[", i), parent = parent_pop)
+  recompute(gs)
+}
+rm(tp.gates)
+rm(parent_pop)
+plot(gs)
+```
+
+
+## Extend Lymph gate
+### Perform gate
+```{r fig.width=12, fig.height= 3}
+parent_pop <- "WBC"
+
+fs <- gs_pop_get_data(gs, parent_pop)
+tp.gates <- fsApply(fs, f.Expanded_Lymph_gating2)
+
+### add gate
+```
+
+
+```{r, fig.height=3, fig.width=15}
+for (i in 1:length(tp.gates[[1]])) {
+  gs_pop_add(gs, lapply(tp.gates, "[[", i), parent = parent_pop)
+  recompute(gs)
+}
+rm(tp.gates)
+rm(parent_pop)
+plot(gs)
+```
+
+
+## pre-PDC Baso Gate
+This step remove CD19 positive cells from WBC, hairy cells often express CD123 and HLA-DR, can be confused as PDCs without examing their CD19 expression. 
+
+MF NOT USING 
+### Perform gate
+```{r fig.width=12, fig.height= 3, eval=FALSE}
+parent_pop <- "WBC"
+
+fs <- gs_pop_get_data(gs, parent_pop)
+#tp.gates <- fsApply(fs, f.PDC_Baso)
+tp.gates <- fsApply(fs, f.prePDC_Baso)
+```
+
+### Add  Gate (MF NOT USING)
+```{r, fig.height=3, fig.width=15, eval=FALSE}
+if(is.null(tp.gates[[1]])) {} else {
+  for (i in 1:length(tp.gates[[1]])) {
+  gs_pop_add(gs, lapply(tp.gates, "[[", i), parent = parent_pop)
+  recompute(gs)
+}
+rm(tp.gates)
+rm(parent_pop)
+plot(gs)
+}
+
+```
+
+## PDC Baso
+### Perform gate (MF NOT USING)
+```{r fig.width=12, fig.height= 3, eval=FALSE}
+parent_pop <- "WBC"
+
+fs <- gs_pop_get_data(gs, parent_pop)
+#tp.gates <- fsApply(fs, f.PDC_Baso)
+tp.gates <- fsApply(fs, f.PDC_Baso)
+```
+
+### Add PDC Baso Gate
+```{r, fig.height=3, fig.width=15, eval = FALSE}
+if(is.null(tp.gates[[1]])) {} else {
+  for (i in 1:length(tp.gates[[1]])) {
+  gs_pop_add(gs, lapply(tp.gates, "[[", i), parent = parent_pop)
+  recompute(gs)
+}
+rm(tp.gates)
+rm(parent_pop)
+plot(gs)
+}
+
+```
+
+
+## Mono gating
+### Perform lymph and mono gate. when flowframe has zero cesll. dummy gate is 
+created
+
+```{r fig.width=12, fig.height= 3}
+parent_pop <- "Exp_Lymph"
+
+fs <- gs_pop_get_data(gs, parent_pop)
+tp.gates <- fsApply(fs, f.lymph_mono_gating_B)
+```
+
+
+
+
+### add mono and lymph gates 
+```{r, fig.height=3, fig.width=15}
+for (i in 1:length(tp.gates[[1]])) {
+  gs_pop_add(gs, lapply(tp.gates, "[[", i), parent = parent_pop)
+  recompute(gs)
+}
+rm(tp.gates)
+rm(parent_pop)
+plot(gs)
+```
+
+
+
+## NonT gating, removing T cells
+### Perform gate
+```{r fig.height=3, fig.width=12}
+parent_pop <- "Lymph"
+fs <- gs_pop_get_data(gs, parent_pop)
+tp.gates <- fsApply(fs, f.NonT_gating2)
+# write.FCS(fs[[10]], paste0(parent_pop, "_", identifier(fs[[10]])))
+```
+
+```{r, fig.height=3, fig.width=15}
+gs_pop_add(gs, lapply(tp.gates, "[[", 1), negated = T, parent = parent_pop)
+recompute(gs)
+
+gs_pop_add(gs, lapply(tp.gates, "[[", 2), parent = parent_pop)
+recompute(gs)
+
+rm(tp.gates)
+rm(parent_pop)
+plot(gs)
+```
+
+
+
+
+## B gate
+### Perform gate
+```{r fig.height=3, fig.width=12}
+parent_pop <- "NonT"
+fs <- gs_pop_get_data(gs, parent_pop)
+tp.gates <- fsApply(fs, f.Bgate)
+# write.FCS(fs[[10]], paste0(parent_pop, "_", identifier(fs[[10]])))
+```
+
+
+```{r fig.height=3, fig.width=15}
+for (i in 1:length(tp.gates[[1]])) {
+  gs_pop_add(gs, lapply(tp.gates, "[[", i), parent = parent_pop)
+  recompute(gs)
+}
+rm(tp.gates)
+rm(parent_pop)
+plot(gs)
+```
+
+
+
+```{r}
+# soucing a trick file 
+# library(reticulate)
+# if(Sys.info()['sysname'] == "Darwin") {
+#   use_virtualenv("/Users/xuehai/Developer/MagicTab/venv")
+# } else if(Sys.info()['sysname'] == "Linux") {
+#   use_python("/usr/bin/python3")
+# }
+parc <- import("parc", convert = T)
+```
+
+## Perform clustering on NonT
+```{r include=FALSE}
+fs <- gs_pop_get_data(gs, "NonT")
+
+# Prepare the data
+fs_cluster <- lapply(seq(length(fs)), function(x) {
+  
+  markers <- StrExtract(as.character(na.omit(parameters(fs[[x]])$desc)), "_", 1)
+  # markers <- markers[!markers %in% c("LiveDead", "CD19")]
+  markers
+  markers <- markers[!markers %in% c(
+    "LiveDead", 
+    "CD14", 
+    "Kappa", "Lambda",
+    #"CD30", "CD27", # "CD23",
+    "CD34"
+    #"CD138"
+    # could be affect by kappa compensation
+  )]
+  channels.ind <- Find.markers(fs[[x]], markers)
+
+  cat(identifier(fs[[x]]), ":", nrow(fs[[x]]), "NonT cells \n")
+  df <- exprs(fs[[x]])
+  # rownames(df) <- which(gh_pop_get_indices(gs[[x]], "NonT") == TRUE)
+  
+  cluster_labels <-1
+  tryCatch(
+  expr = {
+    a <- c <- 0
+    b <- 0.004
+    df[, c("FSC-A", "SSC-A")] <- apply(df[, c("FSC-A", "SSC-A")], 2, function(x) {
+      asinh(a + b * x) + c
+    })
+    df[, c("FSC-A", "SSC-A")] <- rescale(df[, c("FSC-A", "SSC-A")], c(-0.5, 4))
+
+
+    # df <- df[, !colnames(df) %in% c("R675-A", "YG585-A")]
+    clustering.index <- c(1, 4, channels.ind)
+
+    parc1 <- parc$PARC(df[, clustering.index],
+      jac_std_global = 0.15, resolution_parameter = 1, random_seed = 23L, small_pop = 50L
+    )
+    parc1$run_PARC()
+    cluster_labels <- unlist(parc1$labels) + 1
+  },
+  error = function(e) {
+    print("!!!!!")
+    cluster_labels <<- rep(1, nrow(df))
+  }
+  
+)
+
+
+l.df <- split(as.data.frame(df), f = cluster_labels)
+l.df
+  
+  
+})
+```
+
+
+
+
+## prep fs_cluster data for classifer 
+```{r}
+markers <- as.character(na.omit(parameters(fs[[1]])$desc))
+markers <- markers[!markers %in% c("LiveDead", "CD14_SparkBlue574")]
+# markers <- StrExtract(markers, "_", 1)
+
+channels.ind <- Find.markers(fs[[1]], markers)
+names(channels.ind) <- StrExtract(names(channels.ind), "_", 1)
+
+cor_list <- list(
+  Cor_KL = c("Kappa", "Lambda"),
+  Cor_CD5_CD200 = c("CD5", "CD200"),
+  Cor_V750_V660 = c("CD5", "CD27")
+)
+
+
+l.dat <- lapply(fs_cluster, function(fr) {
+  # no need to remove small cluster for real data
+  # fr <- Filter(function(matrix) nrow(matrix) >= 100, fr)
+
+  med <- lapply(fr, function(df) {
+    df <- as.matrix(df)
+    df <- df[, c(1, 4, channels.ind)]
+    colnames(df) <- c("FSC-A", "SSC-A", names(channels.ind))
+    med <- apply(df, 2, median)
+    med
+  })
+
+
+  stats <- lapply(fr, function(df) {
+    df <- as.matrix(df)
+
+    unlist(lapply(cor_list, function(l) {
+      cor(df[, channels.ind[l]])[2, 1]
+    }))
+  })
+
+
+  as.data.frame(cbind(do.call(rbind, med), do.call(rbind, stats)))
+})
+
+# write.csv(meds, "/Users/xuehai/Library/CloudStorage/GoogleDrive-victorrwang@gmail.com/My Drive/WORK/DATA/FCS/32C_AI/mediums_tubeB.csv")
+```
+
+```{r eval=FALSE, include=FALSE}
+# seems there is no need to import
+tabpfn <- import("tabpfn", convert = T)
+```
+
+## clf_Lymph
+```{r eval=FALSE, include=FALSE}
+classifers_folder <- paste0(AUTOFLOW_destination, "src/classifers/")
+clf_Lymph <- py_load_object( paste0(classifers_folder, "clf_Lymph.pickle"), 
+                             pickle = "pickle", convert = TRUE)
+
+clf_Lymph_output <- lapply(l.dat, function(x) {
+  f.tabpfn(x, clf_Lymph)
+})
+```
+
+```{r}
+
+if(Sys.info()["machine"] == "x86_64") {
+  classifers_folder <- paste0(AUTOFLOW_destination, "src/classifers/X86/")
+
+}else{
+  cat("AS Mac")
+ #classifers_folder <- paste0(AUTOFLOW_destination, "src/classifers/ARM64_209/")
+  classifers_folder <- paste0(AUTOFLOW_destination, "src/classifers/X86/")
+ #the pickle file under ARM64 is produced by M4 Macmini with different tapPFN version, however it seems not working with the M4 Macbook pro, showing error "ModuleNotFoundError: No module named 'tabpfn.model.attention"
+ # the M4 MBP works with x86 files that genreated by x86 Mac
+}
+
+
+
+clf_Lymph <- py_load_object( paste0(classifers_folder, "clf_Lymph.pickle"), 
+                             pickle = "pickle", convert = TRUE)
+
+clf_Lymph_output <- lapply(l.dat, function(x) {
+  f.tabpfn(x, clf_Lymph)
+})
+```
+
+
+## Perform Meta clustering for B pops
+```{r}
+meta_cluster <- lapply(seq(length(l.dat)), function(i) {
+  dat_B <- l.dat[[i]][clf_Lymph_output[[i]]$pred_class == "B", ]
+  if (nrow(dat_B) > 1) {
+    adj.matrix <- 1 - cor(t(dat_B))
+    hc <- hclust(dist(adj.matrix)) # this is not quite right, but using dist instead of as.dist giving better results
+    dic <- data.frame(CLST = rownames(dat_B), META = cutree(hc, k = min(nrow(adj.matrix), 4)))
+    dic
+  } else if (nrow(dat_B) == 1) {
+    dic <- data.frame(CLST = rownames(dat_B), META = 1#rownames(dat_B)
+                      )
+    dic
+  } else {
+    NULL
+  }
+})
+```
+
+
+
+## Prep B cell median data 
+```{r}
+markers <- as.character(na.omit(parameters(fs[[1]])$desc))
+markers <- markers[!markers %in% c("LiveDead", "CD14_SparkBlue574")]
+# markers <- StrExtract(markers, "_", 1)
+
+channels.ind <- Find.markers(fs[[1]], markers)
+names(channels.ind) <- StrExtract(names(channels.ind), "_", 1)
+
+cor_list <- list(
+  Cor_KL = c("Kappa", "Lambda"),
+  Cor_CD5_CD200 = c("CD5", "CD200"),
+  Cor_V750_V660 = c("CD5", "CD27")
+)
+
+# Combind the cluster data according to meta_cluster
+
+
+l.dat_B <- lapply(seq(length(fs_cluster)), function(i) {
+  fr <- fs_cluster[[i]]
+  meta <- meta_cluster[[i]]
+  meta_labels <- sort(unique(meta$META))
+
+  dat <- lapply(meta_labels, function(j) {
+    clust <- fr[meta$CLST[meta$META == j]]
+    df <- do.call(rbind, clust)
+    df <- as.matrix(df)
+
+    stat <- unlist(lapply(cor_list, function(l) {
+      cor(df[, channels.ind[l]])[2, 1]
+    }))
+
+    df <- df[, c(1, 4, channels.ind)]
+    colnames(df) <- c("FSC-A", "SSC-A", names(channels.ind))
+    med <- apply(df, 2, median)
+
+
+    c(med, stat)
+  })
+
+  as.data.frame(do.call(rbind, dat))
+})
+```
+
+
+
+## clf_B
+```{r}
+clf_B <- py_load_object(
+  paste0(classifers_folder, "clf_B.pickle"),
+  pickle = "pickle", convert = TRUE)
+
+clf_B_output <- lapply(seq(length(l.dat_B)), function(i) {
+  dat_B <- l.dat_B[[i]]
+  if(nrow(dat_B) > 0) {
+      f.tabpfn(dat_B, clf_B)
+  }else {
+    NULL
+  }
+})
+```
+
+
+##Abnormal
+```{r}
+clf_abB <- py_load_object(
+    paste0(classifers_folder, "clf_abB.pickle"),
+    pickle = "pickle", convert = TRUE)
+# clf_abB <- py_load_object("/Users/xuehai/Developer/AUTOFLOW32/src/classifers/clf_abB_24.pickle", pickle = "pickle",  convert = TRUE)
+
+clf_abB_output <- lapply(seq(length(l.dat_B)), function(i) {
+  abB_clusters <- clf_B_output[[i]]$cluster[which(clf_B_output[[i]]$pred_class != "Poly")]
+  if (length(abB_clusters) > 0) {
+    dat_abB <- l.dat_B[[i]][abB_clusters, ]
+    f.tabpfn(dat_abB, clf_abB)
+  } else {
+    NULL
+  }
+})
+```
+
+
+##Normal
+```{r}
+clf_normalB <- py_load_object(
+      paste0(classifers_folder, "clf_abB_24.pickle"),
+      pickle = "pickle", convert = TRUE)
+
+clf_normalB_output <- lapply(seq(length(l.dat_B)), function(i) {
+  normalB_clusters <- clf_B_output[[i]]$cluster[which(clf_B_output[[i]]$pred_class == "Poly")]
+  if (length(normalB_clusters) > 0) {
+    dat_normalB <- l.dat_B[[i]][normalB_clusters, ]
+    f.tabpfn(dat_normalB, clf_normalB)
+  } else {
+    NULL
+  }
+})
+```
+
+
+## Extract the identity for the population and assign to cells
+```{r}
+l.clust.clf <- lapply(seq(length(fs_cluster)), function(i) {
+  cell_dat <- fs_cluster[[i]]
+
+  clf_Lymph_result <- clf_Lymph_output[[i]]
+
+  clf_B_result <- clf_B_output[[i]]
+  clf_abB_result <- clf_abB_output[[i]]
+  clf_normalB_result <- clf_normalB_output[[i]]
+  meta_result <- meta_cluster[[1]]
+
+
+
+  l.pops_label <- lapply(names(cell_dat), function(j) {
+    lymph_label <- clf_Lymph_result$pred_class[clf_Lymph_result$cluster == j]
+
+    if (lymph_label == "B") {
+      Bpop <- paste0("Pop", meta_result$META[meta_result$CLST == j])
+    } else {
+      Bpop <- ""
+    }
+
+    pops <- paste(lymph_label, Bpop, sep = "_")
+
+    data.frame(cell_index = rownames(cell_dat[[j]]), id = pops)
+  })
+
+  pops_label <- do.call(rbind, l.pops_label)
+
+  pops_label$cell_index <- as.numeric(pops_label$cell_index)
+  pops_label
+  pops_label <- pops_label[order(pops_label$cell_index), ]
+
+
+  pops_label$id
+})
+
+
+names(l.clust.clf) <- sampleNames(fs)
+```
+
+
+```{r fig.height=3, fig.width=12}
+l.clust.NonT <- lapply(l.clust.clf, function(x) {
+  vec <- StrExtract(x, "_", 1)
+  factor(vec, levels = rev(clf_Lymph$classes_))
+})
+
+gs_pop_add(gs, l.clust.NonT, parent = "NonT", name = "CLUSTER")
+recompute(gs)
+plot(gs)
+```
+
+```{r}
+gs_pop_set_name(gs, "CLUSTER_B", "B")
+gs_pop_set_name(gs, "CLUSTER_Diag", "Diag")
+gs_pop_set_name(gs, "CLUSTER_DP", "DP")
+plot(gs)
+```
+
+```{r fig.height=3, fig.width=12}
+# fs <- gs_pop_get_data(gs, "PARC_B")
+# PlotFlowFrame(fs, c("Lambda", "Kappa"), min.xy = 0)
+
+l.clust.B <- lapply(l.clust.clf, function(x) {
+  NonT <- StrExtract(x, "_", 1)
+  vec <- x[NonT == "B"]
+  vec <- StrExtract(vec, "_", 2)
+  factor(vec)
+})
+
+
+gs_pop_add(gs, l.clust.B, parent = "B", name = "B")
+recompute(gs)
+plot(gs)
+```
+
+
+
+
+## GateFinder for finding best gating strategy:
+
+```{r fig.width= 15, fig.height=4}
+  library(GateFinder2)
+fs <- gs_pop_get_data(gs, "B")
+B_subs <- gs_pop_get_children(gs, "B", path = "auto")
+
+Bpop_labels <- as.numeric(gsub("Pop", "", as.character(l.clust.B[[1]]) ))
+
+markers_GF <- as.character(na.omit(parameters(fs[[1]])$desc))
+markers_GF <- markers_GF[!markers_GF %in% c("LiveDead", "CD14_SparkBlue574","CD3_RB790","CD34_PerCP", "CD14_PE-Cy5", "Kappa_APC", "Lambda_PE")]
+# markers <- StrExtract(markers, "_", 1)
+
+channels.ind_GF <- Find.markers(fs[[1]], markers_GF)
+names(channels.ind_GF) <- StrExtract(names(channels.ind_GF), "_", 1)
+
+
+
+l.GateFinder_results <-  lapply(sort(unique(Bpop_labels)), function(t) {
+    
+      dat <- exprs(fs[[1]])
+      x <- dat[,channels.ind_GF]
+      query = Bpop_labels == t
+      events_n = length(query)
+      if(events_n <2000) {downsample = events_n} else {downsample = 2000}
+      results = GateFinder2(x,  query, subsample = downsample, max.iter = 2, outlier.percentile=0.001)
+      plot (x, results, c(1,5), query)
+      plot(dat[query,c(40,50)], pch = ".")
+      plot(dat[results@pops[[2]],c(40,50)], pch = ".")
+
+      
+      plot(results)
+      results
+    
+  })
+  
+names(l.GateFinder_results) <-B_subs
+```
+
+Add Bpop gating strategies to GH
+```{r}
+
+
+lapply(B_subs, function(p) {
+  
+  re = l.GateFinder_results[[p]]
+  gt1 <- re@gates[[1]]
+  gt1 <- rbind(gt1, gt1[1,])
+  gt2 <- re@gates[[2]]
+  gt2 <- rbind(gt2, gt2[1,])
+  
+  gate <- polygonGate(filterId = "GF1", .gate = gt1)
+  gate2 <- polygonGate(filterId = "GF2", .gate = gt2)
+  
+  gs_pop_add(gs, gate, parent = p)
+  recompute(gs)
+  
+  p_sub <- gs_pop_get_children(gs, p, path = "auto")
+  
+  gs_pop_add(gs, gate2, parent = p_sub)
+  recompute(gs)
+  
+  
+})
+
+plot(gs)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Kappla lambda gate 
+### Perform gate
+```{r fig.height=3, fig.width=12}
+B_subs <- gs_pop_get_children(gs, "B", path = "auto")
+
+l.tp.gates <- lapply(B_subs, function(p) {
+  cat("Gate on pop ", p, "\n")
+  fs <- gs_pop_get_data(gs, p)
+  tp.gates <- fsApply(fs, f.KL)
+})
+names(l.tp.gates) <- B_subs
+```
+
+
+### apply gate
+```{r, fig.height=3, fig.width=15}
+lapply(names(l.tp.gates), function(p) {
+  tp.gates <- l.tp.gates[[p]]
+  for (i in 1:length(tp.gates[[1]])) {
+    gs_pop_add(gs, lapply(tp.gates, "[[", i), parent = p)
+    recompute(gs)
+  }
+})
+
+plot(gs)
+```
+
+
+
+
+
+
+
+
+
+## Kappla lambda gate on Total B
+### Perform gate
+```{r fig.height=3, fig.width=12}
+parent_pop <- "B"
+fs <- gs_pop_get_data(gs, parent_pop)
+
+tp.gates <- fsApply(fs, f.KL)
+```
+
+```{r, fig.height=3, fig.width=15}
+for (i in 1:length(tp.gates[[1]])) {
+  gs_pop_add(gs, lapply(tp.gates, "[[", i), parent = parent_pop)
+  recompute(gs)
+}
+rm(tp.gates)
+rm(parent_pop)
+plot(gs)
+```
+
+
+
+```{r eval=FALSE, include=FALSE}
+# AUTOFLOW_destination <- paste0("~/Developer/AUTOFLOW32", "/") # for better decoding
+
+save_gs(gs, path = "/Users/flowuser/Documents/Debug/FCS/NoComp/T/gs/5Bsamples")
+gs <- load_gs(path = "/Users/flowuser/Documents/Debug/FCS/NoComp/T/gs/5B")
+```
+
+
+
+```{r}
+if (length(dev.list()) > 0) {
+  for (i in dev.list()[1]:dev.list()[length(dev.list())]) {
+    dev.off()
+  }
+}
+```
+
+
+
+# Plotting
+
+```{r}
+png.path <- c()
+
+tubeB_colors <- autoflow_colors_CLT$autoflow_30c_B
+tubeB_colors <- adjust_saturation(tubeB_colors, 0.5)
+
+
+TubeB_global_min <- read.csv(plotting_global_mins, row.names = 1)[,"B", drop=F]
+m_names <- markernames(gs[[1]])
+TubeB_global_min$marker_name <- m_names[match(rownames(TubeB_global_min), names(m_names))]
+TubeB_global_min$marker_name <- paste(TubeB_global_min$marker_name, rownames(TubeB_global_min))
+
+```
+
+
+### Middle panel Plotting V2
+```{r fig.height=16, fig.width=13.5, Warning=F}
+middle_panel_layout <- read_excel(layouts, sheet = "Middle_3c")
+
+p <- lapply(gs, function(x) {
+  f.plot_panel(x,
+    transform_csv_path = transformation.parameters.path, postfix = "-middle",
+    layout = middle_panel_layout, width = 8.5, height = 8,
+    path.png = paste0(folder, "/png/"),
+    rendering.type = "Cairo", colors = tubeB_colors,
+    save.png = T,  global.min = TubeB_global_min,
+    show.time = T # , res = 128
+  )
+})
+names(p) <- sampleNames(gs)
+
+
+png.path <- c(png.path, middle = paste0(folder, "/png/", gsub(".fcs", "", sampleNames(gs)), "-middle.png"))
+```
+
+### PreGating panel Plotting V2
+```{r fig.height=16, fig.width=13.5, Warning=F}
+panel_layout <- read_excel(layouts, sheet = "preGate")
+
+ov <- panel_layout[panel_layout$row == 1 | panel_layout$row == 2, ]
+
+
+
+
+blank_row <- panel_layout[15, ]
+blank_row$text <- NA
+
+
+Bpop <- panel_layout[panel_layout$plot == 11, ]
+B_subs <- gs_pop_get_children(gs, "B", path = "auto")
+B_subs <- B_subs[grep("B_Pop",B_subs)]
+
+if (length(B_subs) > 0) {
+  # custom the B pops layout
+  pops <- do.call(rbind, lapply(seq(length(B_subs)), function(i) {
+    pop <- Bpop
+    pop$row <- i
+    x <- B_subs[i]
+
+
+    #dsp <- paste0(x, "\n", dsp_B[i], "\n", dsp_B2[i])
+
+    #pop$text <- gsub("B_Pop", dsp, pop$text)
+    #pop$gates <- gsub("B_Pop", x, pop$gates)
+    pop$subtitle <- x
+   # pop$annotation <- gsub("B_Pop", x, pop$annotation)
+    pop$highlight <- gsub("B_Pop", x, pop$highlight)
+    pop
+  }))
+
+  panel_layout <- rbind(ov, pops)
+  #panel_layout$plot <- as.numeric(rownames(panel_layout))
+} else {
+  panel_layout <- ov
+}
+
+
+while(nrow(panel_layout) <20) {
+  plot_n <- nrow(panel_layout) +1
+  blank_row$plot <- plot_n
+  blank_row$row <- ifelse(plot_n %% 5 == 0, plot_n %/% 5 , plot_n %/% 5 + 1)
+  blank_row$colum <- ifelse(plot_n %% 5 == 0, 5, plot_n %% 5)
+  panel_layout <- rbind(panel_layout, blank_row)
+}
+
+p <- lapply(gs, function(x) {
+  f.plot_panel(x,
+    transform_csv_path = transformation.parameters.path, postfix = "-Pre",
+    layout = panel_layout, width = 16, height = 14,
+    path.png = paste0(folder, "/png/"),
+    rendering.type = "Cairo", colors = tubeB_colors,
+    save.png = T,  global.min = TubeB_global_min,
+    show.time = T  , res = 64
+  )
+})
+names(p) <- sampleNames(gs)
+
+
+png.path <- c(png.path, Pre = paste0(folder, "/png/", gsub(".fcs", "", sampleNames(gs)), "-Pre.png"))
+```
+
+
+### B pops overview panel Plotting V2
+```{r fig.height=16, fig.width=13.5, Warning=F}
+panel_layout <- read_excel(layouts, sheet = "overview_5c")
+
+#ov <- panel_layout[panel_layout$row == 1, ]
+blank_row <- panel_layout[6, ]
+blank_row$text <- NA
+
+
+Bpop <- panel_layout[panel_layout$row == 1, ]
+B_subs <- gs_pop_get_children(gs, "B", path = "auto")
+B_subs <- B_subs[grep("B_Pop",B_subs)]
+
+if (length(B_subs) > 0) {
+
+  # B_result <- clf_B_output[[1]]
+  # dsp_B <- paste0(B_result$pred_class, ":", round(B_result$score, 2))
+  # dsp_B[B_result$score<0.95] <-""
+  # 
+  # B2_result <- rbind(clf_abB_output[[1]], clf_normalB_output[[1]])
+  # B2_result <- B2_result[order(B2_result$cluster), ]
+  # dsp_B2 <- paste0(B2_result$pred_class, ":", round(B2_result$score, 2))
+  # dsp_B2[B2_result$score<0.95] <-""
+
+  # custom the B pops layout
+  pops <- do.call(rbind, lapply(seq(length(B_subs)), function(i) {
+    pop <- Bpop
+    pop$row <- i
+    x <- B_subs[i]
+
+
+    #dsp <- paste0(x, "\n", dsp_B[i], "\n", dsp_B2[i])
+
+    #pop$text <- gsub("B_Pop", dsp, pop$text)
+    pop$gates <- gsub("B_Pop", x, pop$gates)
+    pop$subtitle <- x
+    pop$annotation <- gsub("B_Pop", x, pop$annotation)
+    pop$highlight <- gsub("B_Pop", x, pop$highlight)
+    pop
+  }))
+
+  panel_layout <- pops
+  #panel_layout$plot <- as.numeric(rownames(panel_layout))
+} else {
+}
+
+
+while(nrow(panel_layout) <20) {
+  plot_n <- nrow(panel_layout) +1
+  blank_row$plot <- plot_n
+  blank_row$row <- ifelse(plot_n %% 5 == 0, plot_n %/% 5 , plot_n %/% 5 + 1)
+  blank_row$colum <- ifelse(plot_n %% 5 == 0, 5, plot_n %% 5)
+  panel_layout <- rbind(panel_layout, blank_row)
+}
+
+
+p.overview <- lapply(gs, function(x) {
+  f.plot_panel(x,
+    transform_csv_path = transformation.parameters.path, postfix = "-overview",
+    layout = panel_layout, width = 16, height = 14,
+    path.png = paste0(folder, "/png/"),
+    rendering.type = "Cairo", colors = tubeB_colors, # highlight = "B_Pop_1",
+    save.png = T,  global.min = TubeB_global_min,
+    show.time = T, res = NA
+  )
+})
+names(p.overview) <- sampleNames(gs)
+png.path <- c(png.path, overview = paste0(folder, "/png/", gsub(".fcs", "", sampleNames(gs)), "-overview.png"))
+
+# f.plot_color_legend(autoflow_30c_T)
+```
+
+
+
+
+
+
+
+
+
+### B pops Gating Strategies
+```{r fig.height=16, fig.width=13.5, Warning=F}
+panel_layout <- read_excel(layouts, sheet = "GatingStrategy")
+
+#ov <- panel_layout[panel_layout$row == 1, ]
+blank_row <- panel_layout[6, ]
+blank_row$text <- NA
+
+
+Bpop <- panel_layout[panel_layout$row == 1, ]
+B_subs <- gs_pop_get_children(gs, "B", path = "auto")
+B_subs <- B_subs[grep("B_Pop",B_subs)]
+
+if (length(B_subs) > 0) {
+  
+  
+  
+  pops <- do.call(rbind, lapply(seq(length(B_subs)), function(i) {
+    
+    
+    gf_result <- l.GateFinder_results[[i]]
+
+    pop <- Bpop
+    pop$row <- i 
+    x <- B_subs[i]
+
+    
+    pop$x <- c(names(gf_result@dimx), "Lambda", "Lambda", NA )
+    pop$y <- c(names(gf_result@dimy), "Kappa", "Kappa", NA )
+    
+    pop$parent <- c("B", paste0(x, "/GF1") ,  paste0(x, "/GF1") , paste0(x, "/GF1/GF2") , NA )
+    
+
+    pop$text <- x    #pop$text <- gsub("B_Pop", dsp, pop$text)
+    pop$gates <- gsub("B_Pop", x, pop$gates)
+    pop$subtitle <- x
+    pop$annotation <- gsub("B_Pop", x, pop$annotation)
+    #pop$highlight <- gsub("B_Pop", x, pop$highlight)
+    pop
+  }))
+
+  panel_layout <- pops
+  
+  
+  while(nrow(panel_layout) <20) {
+  plot_n <- nrow(panel_layout) +1
+  blank_row$plot <- plot_n
+  blank_row$row <- ifelse(plot_n %% 5 == 0, plot_n %/% 5 , plot_n %/% 5 + 1)
+  blank_row$colum <- ifelse(plot_n %% 5 == 0, 5, plot_n %% 5)
+  panel_layout <- rbind(panel_layout, blank_row)
+}
+
+p.GatingStrategy <- lapply(gs, function(x) {
+  f.plot_panel(x,
+    transform_csv_path = transformation.parameters.path, postfix = "-GatingStrategy",
+    layout = panel_layout, width = 16, height = 14, Gatefinder = l.GateFinder_results,
+    path.png = paste0(folder, "/png/"),
+    #path.png = "/Users/xuehai/Downloads",
+    rendering.type = "Cairo", colors = tubeB_colors, # highlight = "B_Pop_1",
+    gates.color = "red",
+    save.png = T,  global.min = TubeB_global_min,
+    show.time = T, res = NA
+  )
+})
+names(p.GatingStrategy) <- sampleNames(gs)
+png.path <- c(png.path, gatingstrategy = paste0(folder, "/png/", gsub(".fcs", "", sampleNames(gs)), "-GatingStrategy.png"))
+
+} else {
+  
+}
+
+# only plot the gating strategy when there is B pops
+```
+
+
+
+
+
+### B pops panel Plotting
+```{r fig.height=16, fig.width=13.5, Warning=F}
+# layouts <- paste0(AUTOFLOW_destination, "src/30c_B_layout_CLF.xlsx")
+B_subs <- gs_pop_get_children(gs, "B", path = "auto")
+B_subs <- B_subs[grep("B_Pop",B_subs)]
+
+if (length(B_subs) > 0) {
+  panel_layout <- read_excel(layouts, sheet = "Bpop_5c")
+
+  for (i in 1:length(B_subs)) {
+    Bpop_panel_layout <- panel_layout
+
+    Bpop <- B_subs[i]
+    # Bpop_panel_layout$text <- gsub("B_Pop", Bpop, Bpop_panel_layout$text)
+    Bpop_panel_layout$parent <- gsub("B_Pop", Bpop, Bpop_panel_layout$parent)
+    Bpop_panel_layout$gates <- gsub("B_Pop", Bpop, Bpop_panel_layout$gates)
+    Bpop_panel_layout$annotation <- gsub("B_Pop", Bpop, Bpop_panel_layout$annotation)
+    Bpop_panel_layout$highlight <- gsub("B_Pop", Bpop, Bpop_panel_layout$highlight)
+
+    adjusted_colors <- tubeB_colors
+    adjusted_colors[B_subs[-i]] <- lighten(adjusted_colors[B_subs[-i]], factor = 0.8)
+
+    lapply(gs, function(x) {
+      f.plot_panel(x,
+        transform_csv_path = transformation.parameters.path, postfix = paste0("-Bpop", i),
+        layout = Bpop_panel_layout, width = 16, height = 14,
+        path.png = paste0(folder, "/png/"),
+        rendering.type = "Cairo", colors = adjusted_colors, # highlight = "B_Pop_1",
+        save.png = T,  global.min = TubeB_global_min,
+        show.time = T, res = NA
+      )
+    })
+
+    # names(p.B1) <- sampleNames(gs)
+
+    png.path <- c(png.path, bpop = paste0(folder, "/png/", gsub(".fcs", "", sampleNames(gs)), "-Bpop", i, ".png"))
+    names(png.path)[length(png.path)] <- paste0("bpop", i)
+  }
+}
+
+```
+
+
+### B pops Extra Markers Plotting
+```{r fig.height=16, fig.width=13.5, Warning=F}
+# layouts <- paste0(AUTOFLOW_destination, "src/30c_B_layout_CLF.xlsx")
+panel_layout <- read_excel(layouts, sheet = "Bpop_Extra_5c")
+
+#ov <- panel_layout[panel_layout$row == 1, ]
+blank_row <- panel_layout[6, ]
+blank_row$text <- NA
+
+
+Bpop <- panel_layout[panel_layout$row == 1, ]
+B_subs <- gs_pop_get_children(gs, "B", path = "auto")
+B_subs <- B_subs[grep("B_Pop",B_subs)]
+
+if (length(B_subs) > 0) {
+
+  # custom the B pops layout
+  pops <- do.call(rbind, lapply(seq(length(B_subs)), function(i) {
+    pop <- Bpop
+    pop$row <- i
+    x <- B_subs[i]
+
+
+    pop$gates <- gsub("B_Pop", x, pop$gates)
+    pop$subtitle <- x
+    pop$annotation <- gsub("B_Pop", x, pop$annotation)
+    pop$highlight <- gsub("B_Pop", x, pop$highlight)
+    pop
+  }))
+
+  panel_layout <- pops
+  #panel_layout$plot <- as.numeric(rownames(panel_layout))
+} else {
+}
+
+
+while(nrow(panel_layout) <20) {
+  plot_n <- nrow(panel_layout) +1
+  blank_row$plot <- plot_n
+  blank_row$row <- ifelse(plot_n %% 5 == 0, plot_n %/% 5 , plot_n %/% 5 + 1)
+  blank_row$colum <- ifelse(plot_n %% 5 == 0, 5, plot_n %% 5)
+  panel_layout <- rbind(panel_layout, blank_row)
+}
+
+
+p.extra <- lapply(gs, function(x) {
+  f.plot_panel(x,
+    transform_csv_path = transformation.parameters.path, postfix = "-Bpop_Extra_5c",
+    layout = panel_layout, width = 16, height = 14,
+    path.png = paste0(folder, "/png/"),
+    rendering.type = "Cairo", colors = tubeB_colors, # highlight = "B_Pop_1",
+    save.png = T,  global.min = TubeB_global_min,
+    show.time = T, res = NA
+  )
+})
+
+
+
+names(p.extra) <- sampleNames(gs)
+
+png.path <- c(png.path, bpop_extra = paste0(folder, "/png/", gsub(".fcs", "", sampleNames(gs)), "-Bpop_Extra_5c.png"))
+
+```
+
+
+
+
+### All B pops panel Plotting V2
+```{r fig.height=16, fig.width=13.5, Warning=F}
+panel_layout <- read_excel(layouts, sheet = "Bpop_5c")
+
+
+Bpop_all_layout <- panel_layout
+
+
+Bpop_all_layout$parent <- gsub("B_Pop", "B", Bpop_all_layout$parent)
+Bpop_all_layout$gates <- gsub("B_Pop/IgK;B_Pop/IgL;B_Pop/IgNULL", "B/IgK;B/IgL;B/IgNULL", Bpop_all_layout$gates)
+Bpop_all_layout$annotation <- gsub("B_Pop/IgK;NA;B_Pop/IgNULL;B_Pop/IgL", "B/IgK;NA;B/IgNULL;B/IgL", Bpop_all_layout$annotation)
+#Bpop_all_layout$highlight <- gsub("B_Pop", paste(B_subs, collapse = "; "), Bpop_all_layout$highlight)
+Bpop_all_layout$highlight <- gsub("B_Pop", NA, Bpop_all_layout$highlight)
+
+
+
+
+lapply(gs, function(x) {
+  f.plot_panel(x,
+    transform_csv_path = transformation.parameters.path, postfix = "-BpopAll",
+    layout = Bpop_all_layout, width = 16, height = 14,
+    path.png = paste0(folder, "/png/"),
+    rendering.type = "Cairo", colors = tubeB_colors, # highlight = "B_Pop_1",
+    save.png = T,  global.min = TubeB_global_min,
+    show.time = T, res = NA
+  )
+})
+
+
+png.path <- c(png.path, bpopAll = paste0(folder, "/png/", gsub(".fcs", "", sampleNames(gs)), "-BpopAll.png"))
+```
+
+### Blast 
+
+```{r fig.height=16, fig.width=10, Warning=F}
+Blast_layout <- read_excel(layouts, sheet = "Blast")
+
+
+p <- lapply(gs, function(x) {
+  f.plot_panel(x, 
+    transform_csv_path = transformation.parameters.path, postfix = "-blast",  
+    layout = Blast_layout, width = 16, height = 14,
+    path.png = paste0(folder, "/png/"), colors = tubeB_colors,
+    rendering.type = "Cairo", 
+    save.png = T,  global.min = TubeB_global_min,
+    show.time = T
+  )
+})
+names(p) <- sampleNames(gs)
+
+
+
+
+
+png.path <- c(png.path, blast = paste0(folder, "/png/",gsub(".fcs", "", sampleNames(gs)), "-blast.png"))
+# f.plot_color_legend(autoflow_30c_T)
+```
+
+
+### CD45 vs All
+
+```{r fig.height=16, fig.width=10, Warning=F}
+CD45all_layout <- read_excel(layouts, sheet = "CD45all")
+y_markers <- StrExtract(markers, "_", 1)
+y_markers <- y_markers[y_markers != "CD45"]
+
+CD45all_layout <- CD45all_layout[1:length(y_markers), ]
+CD45all_layout$y  <- paste0(y_markers, "_")
+
+p <- lapply(gs, function(x) {
+  f.plot_panel(x, 
+    transform_csv_path = transformation.parameters.path, postfix = "-cd45all",  
+    layout = CD45all_layout, width = 16, height = 14,
+    path.png = paste0(folder, "/png/"), colors = tubeB_colors,
+    rendering.type = "Cairo", 
+    save.png = T,  global.min = TubeB_global_min,
+    show.time = T
+  )
+})
+names(p) <- sampleNames(gs)
+
+
+
+
+
+png.path <- c(png.path, cd45all = paste0(folder, "/png/",gsub(".fcs", "", sampleNames(gs)), "-cd45all.png"))
+# f.plot_color_legend(autoflow_30c_T)
+```
+
+
+# Perform UMAP
+```{r echo=FALSE, fig.height=16, fig.width=13.5, Warning=F}
+library(uwot)
+
+UMAP_population <- "Exp_Lymph"
+# rotating DAT
+fs <- gs_pop_get_data(gs, "root")
+
+markers <- StrExtract(as.character(na.omit(parameters(fs[[1]])$desc)), "_", 1)
+markers <- markers[!markers %in% c("LiveDead", "CD3", "Kappa", "Lambda")]
+markers
+channels.ind <- Find.markers(fs[[1]], markers)
+
+fs_UMAP <- fsApply(fs[1], function(x) { # x =fs_pca[[9]]
+
+  spl <- identifier(x)
+  cat("Performing UMAP for sample: ", spl, "\n")
+  idx <- gh_pop_get_indices(gs[[spl]], UMAP_population)
+  idx <- which(idx)
+
+  if (length(idx) != 0) {
+    df <- exprs(x)
+    # transform FSC SSC
+    a <- c <- 0
+    b <- 0.004
+    df[, c("FSC-A", "SSC-A")] <- apply(df[, c("FSC-A", "SSC-A")], 2, function(x) {
+      asinh(a + b * x) + c
+    })
+    df[, c("FSC-A", "SSC-A")] <- rescale(df[, c("FSC-A", "SSC-A")], c(-0.5, 4))
+
+
+    # Anonymize the light chain
+
+    # IgL <- df[, c(grep("R675-A", colnames(df)), grep("YG585", colnames(df)))]
+    # 
+    # # Set limits
+    # if (nrow(IgL) > 500) {
+    #   IgL <- apply(IgL, 2, function(x) {
+    #     q <- quantile(x, c(0.005, 0.995))
+    #     x <- pmax(x, q[1])
+    #     x <- pmin(x, q[2])
+    #     # x[x >= q[2]] <- q[2]
+    #     # x[x <= q[1]] <- q[1]
+    #     x
+    #   })
+    # }
+    # 
+    # IgL <- apply(IgL, 2, function(x) {
+    #   x <- rescale(x, c(min(IgL), max(IgL)))
+    # })
+    # 
+    # 
+    # KL <- apply(IgL, 1, max)
+    # 
+    # df <- cbind(df, KL) # remove KL
+    # 
+    # # df <- df[, !colnames(df) %in% c("R675-A", "YG585-A")]
+    # clustering.index <- c(1, 4, channels.ind, ncol(df))
+
+    clustering.index <- c(1, 4, channels.ind)
+
+    root_umap <- matrix(data = 0, nrow = nrow(df), ncol = 2)
+    colnames(root_umap) <- c("UMAP1", "UMAP2")
+    # Dimension reduction using UMAP
+    #---------------------------------------
+    if (length(idx) > 30) {
+      nn <- 30
+
+      if (length(idx) > 100000) {
+        idx <- sample(idx, 100000)
+      }
+    } else {
+      nn <- length(idx)
+    }
+
+
+
+    start_time <- Sys.time()
+    set.seed(23)
+    t.umap <- system.time(
+      umap <- umap(as.matrix(df[idx, channels.ind]),
+        n_neighbors = nn, metric = "euclidean", min_dist = 0.3,
+        # learning_rate = 0.5,
+        verbose = TRUE, n_threads = max(1, (RcppParallel::defaultNumThreads() - 1)),
+        init = "random"
+      )
+    )
+
+    cat("DONE ~", t.umap[3], "s\n", " UMAP done...")
+
+
+    # colnames(umap) <- c("UMAP1", "UMAP2")
+    umap <- apply(umap, 2, function(x) {
+      rescale(x, c(0, 4.5))
+    })
+    root_umap[idx, ] <- umap
+
+    list ( fcs = f.addChannel(x, root_umap),
+           umap = root_umap )
+    
+  } else {
+    list ( fcs = x,
+           umap = NULL )
+  }
+})
+```
+
+
+
+# Interactive UMAP
+```{r}
+umap_colors <- autoflow_colors_CLT$autoflow_30c_B
+interactive_UMAP <- lapply(seq(length(gs)), function(g) {
+  
+  map <- fs_UMAP[[g]]$umap
+  id_vec <- f.get_event_identity(gs[[g]], color_scheme = umap_colors)
+  plotting_events <- apply(map, 1, sum) !=0
+  
+  df <- as.data.frame(map[plotting_events, ]) 
+  df$SOM  <- id_vec[plotting_events]
+  df$SOM <- gsub("CLUSTER_", "",  df$SOM)
+  
+  #df <- df[!(df$SOM%in% c("CLUSTER_Baso", "CLUSTER_PDC")), ]
+  
+  if(nrow(df) > 10000) {
+    df <- df[sample(nrow(df), 10000), ]
+  }
+  
+    # p
+  if (nrow(df) < 500) {
+    size <- 5
+  } else {
+    size <- 3
+  }
+  
+  #x_range <- c(min(min(df$UMAP1) * 0.9, min(df$UMAP1) * 1.1), max(max(df$UMAP1) * 0.9, max(df$UMAP1) * 1.1))
+  #y_range <- c(min(min(df$UMAP2) * 0.9, min(df$UMAP2) * 1.1), max(max(df$UMAP2) * 0.9, max(df$UMAP2) * 1.1))
+  
+    plot_ly(
+    data = df, x = ~UMAP1, y = ~UMAP2, color = ~SOM, legendgroup = ~SOM, colors = umap_colors,
+    type = "scatter", mode = "markers", # symbol = ~pop,
+    marker = list(size = size),
+    hoverinfo = "text",
+    text = ~SOM) %>% layout(#title = 'Styled Scatter'
+    xaxis = list(showticklabels = FALSE, zeroline = FALSE, showgrid = FALSE, title=''),
+    yaxis = list(showticklabels = FALSE, zeroline = FALSE, showgrid = FALSE, title=''),
+     legend = list(
+        font = list(size = 12), 
+        size = 2,
+        itemsizing = "constant",
+        orientation = "v"
+        #xanchor = "center", x = 0.5, y = -0.2
+      )
+  )
+    # %>%
+    # layout( # title = 'Styled Scatter',
+    #   # width = 350, height = 400,
+    #   hoverlabel = list(font = list(size = 20)), margin = list(l = 25, r = 25, b = 10, t = 25, pad = 0),
+    #   yaxis = list(
+    #     zeroline = FALSE, # scaleanchor = "x",
+    #     range = list(y_range[1], y_range[2]),
+    #     titlefont = list(size = 12),
+    #     title = list(text = "UMAP2", standoff = 5L), tickfont = list(size = 8)
+    #   ),
+    #   xaxis = list(
+    #     zeroline = FALSE,
+    #     range = list(x_range[1], x_range[2]),
+    #     titlefont = list(size = 12),
+    #     title = list(text = "UMAP1", standoff = 5L), tickfont = list(size = 8)
+    #   ),
+    #   legend = list(
+    #     font = list(size = 10), size = 1.5,
+    #     itemsizing = "constant",
+    #     orientation = "h",
+    #     xanchor = "center", x = 0.5, y = -0.2
+    #   )
+    # )
+  
+    
+    
+  
+})
+names(interactive_UMAP) <- sampleNames(gs)
+
+```
+
+
+
+
+
+# Static UMAP no perfrming 
+```{r eval=FALSE, include=FALSE}
+umap_layout <- read_excel(layouts, sheet = "UMAP")
+
+p.umap <- lapply(seq(length(gs)), function(x) {
+  f.plot_panel(gs[[x]],
+    DR_flowframe = fs_UMAP[[x]],
+    layout = umap_layout,
+    transform_csv_path = transformation.parameters.path,
+    colors = tubeB_colors,
+    width = 8, height = 6, postfix = "-UMAP",
+    path.png = paste0(folder, "/png/"),
+    rendering.type = "Cairo",
+    save.png = T,  global.min = TubeB_global_min,
+    show.time = T
+  )
+})
+
+names(p.umap) <- sampleNames(gs)
+
+
+png.path <- c(png.path, umap = paste0(folder, "/png/", gsub(".fcs", "", sampleNames(gs)), "-UMAP.png"))
+```
+
+
+
+
+### UMAP Plotting V2
+```{r fig.height=16, fig.width=13.5, Warning=F}
+heatmap_layout <- read_excel(layouts, sheet = "UMAP_heat")
+
+
+p.umap <- lapply(seq(length(gs)), function(x) {
+  f.plot_panel(gs[[x]],
+    DR_flowframe = fs_UMAP[[x]]$fcs,
+    layout = heatmap_layout,
+    transform_csv_path = transformation.parameters.path,
+    colors = tubeB_colors,
+    width = 16, height = 14, postfix = "-UMAP_heat",
+    path.png = paste0(folder, "/png/"),
+    rendering.type = "Cairo",
+    save.png = T,  global.min = TubeB_global_min,
+    show.time = T
+  )
+})
+
+names(p.umap) <- sampleNames(gs)
+
+
+png.path <- c(png.path, umap_heat = paste0(folder, "/png/", gsub(".fcs", "", sampleNames(gs)), "-UMAP_heat.png"))
+
+
+```
+
+
+
+
+
+```{r}
+if (length(dev.list()) > 0) {
+  for (i in dev.list()[1]:dev.list()[length(dev.list())]) {
+    dev.off()
+  }
+}
+```
+
+
+
+
+
+## Save data
+### stats
+```{r}
+raw_counts <- gs_pop_get_stats(gs[[1]], gs_get_pop_paths(gs, path = "auto"), "count", xml = F)
+
+obj <- gs[[1]] # gs is required here to extract the population information
+nodes_path <- setNames(gh_get_pop_paths(obj, path = "full"), gh_get_pop_paths(obj, path = "auto"))
+cell_identity <- as.data.frame(do.call(cbind, lapply(names(nodes_path), function(x) {
+  gh_pop_get_indices(obj, x)
+}))) # extract the cell identity
+colnames(cell_identity) <- gh_get_pop_paths(obj, path = "auto")
+
+add_raw_counts <-  raw_counts[1:2, ]
+add_raw_counts$pop <- c("PDC_within_LymphGate", "Baso_within_LymphGate")
+add_raw_counts$count <- c(sum(cell_identity$Lymph == T & cell_identity$PDC == T), sum(cell_identity$Lymph == T & cell_identity$Baso == T))
+
+raw_counts <- rbind(raw_counts, add_raw_counts)
+```
+
+
+
+### Save the data
+```{r}
+# if (analysis == "batch") {
+#   write.table(sampleNames(fs.14n), file = paste(folder, sub.folder, "T.sampleNames.txt", sep = "/"), row.names = F, col.names = F)
+#   save(l.T.data, file = paste(folder, "data", sub.folder, "l.T.data.Rdata", sep = "/"))
+# }
+
+if (analysis == "SingleCase") {
+  l.B.data <- list(
+    raw.counts = raw_counts,
+    png.path = png.path,
+    in_UMAP = interactive_UMAP,
+    comp.filename = "spillover_B_20251023_143636.csv"
+    # plot.PCA = p.pca,
+    # plot.UMAP = p.umap,
+    # plot.main = p,
+    # plot.overview = p.overview,
+    # plot.B1 = p.B1,
+    # plot.B2 = p.B2,
+    # plot.B3 = p.B3,
+    # plot.B4 = p.B4
+  )
+
+  # BF <- StrExtract(fs.names, " ", 1)
+  rd_name <- paste0("l.B.data.", StrExtract(fs.names, ".fcs", 1), ".Rdata")
+  save(l.B.data,
+    file = paste(folder, "data",
+      paste0("l.B.data.", StrExtract(fs.names, ".fcs", 1), ".Rdata"),
+      sep = "/"
+    )
+  )
+  write.csv(raw_counts,
+    file = paste(folder, "stats/counts",
+      paste0(StrExtract(fs.names, ".fcs", 1), ".csv"),
+      sep = "/"
+    )
+  )
+
+  # CytoML::gatingset_to_flowjo(gs,
+  #                             outFile = paste0(StrExtract(fs.names, ".fcs", 1), ".wsp")
+  #                             )
+}
+```
+
+
+
+
+
+
